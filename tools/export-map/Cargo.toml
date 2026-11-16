@@ -1,0 +1,24 @@
+[package]
+name = "export-map"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: not part of any parent workspace.
+[workspace]
+
+[dependencies]
+# Kainz's own map editor crates, read-only by path. Never edit them from here.
+rbsp = { path = "../../../../apex/r5ed/crates/rbsp" }
+rcomp = { path = "../../../../apex/r5ed/crates/rcomp" }
+rpak = { path = "../../../../apex/r5ed/crates/rpak" }
+glam = "0.30"
+serde_json = "1"
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+bcdec_rs = "0.2"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+codegen-units = 16
