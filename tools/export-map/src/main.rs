@@ -9,6 +9,7 @@
 //! RSX; the install is only ever read (RSX gets copies, see assets.rs).
 
 mod assets;
+mod coll;
 mod gltf;
 mod mats;
 mod tex;
@@ -38,18 +39,22 @@ struct Args {
     lightmaps: bool,
     clean: bool,
     prop_tri_budget: usize,
+    collision_only: bool,
+    prop_physics: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: export-map [map] [--model <mdl/..rmdl>] [--out <dir>] [--tex <px>] [--prop-tex <px>] [--prop-tris <n>] [--no-normals] [--no-lightmap] [--clean]\n\
+        "usage: export-map [map] [--model <mdl/..rmdl>] [--out <dir>] [--tex <px>] [--prop-tex <px>] [--prop-tris <n>] [--no-normals] [--no-lightmap] [--clean] [--collision] [--prop-physics]\n\
+         --collision: only (re)write collision.bin, reusing the BSP the last export extracted\n\
+         --prop-physics: also write static props' physics trees into collision.bin (source 3)\n\
          env: R5_GAME_ROOT (default {DEFAULT_GAME}), R5_RSX (default the r5ed bundle's rsx.exe), R5_EXPORT_WORK (default %TEMP%\\r5-export-map)"
     );
     std::process::exit(2)
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { map: DEFAULT_MAP.into(), models: Vec::new(), out: None, world_cap: 1024, prop_cap: 512, normals: true, lightmaps: true, clean: false, prop_tri_budget: 5_500_000 };
+    let mut a = Args { map: DEFAULT_MAP.into(), models: Vec::new(), out: None, world_cap: 1024, prop_cap: 512, normals: true, lightmaps: true, clean: false, prop_tri_budget: 5_500_000, collision_only: false, prop_physics: false };
     let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -61,6 +66,8 @@ fn parse_args() -> Args {
             "--prop-tris" => a.prop_tri_budget = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--no-lightmap" => a.lightmaps = false,
             "--clean" => a.clean = true,
+            "--collision" => a.collision_only = true,
+            "--prop-physics" => a.prop_physics = true,
             "-h" | "--help" => usage(),
             s if s.starts_with('-') => usage(),
             s => a.map = s.to_string(),
@@ -123,7 +130,13 @@ fn main() {
             return;
         }
     }
-    let result = if args.models.is_empty() { export_map(&args, cfg) } else { export_model_cmd(&args, cfg) };
+    let result = if args.collision_only {
+        export_collision_cmd(&args, cfg)
+    } else if args.models.is_empty() {
+        export_map(&args, cfg)
+    } else {
+        export_model_cmd(&args, cfg)
+    };
     if let Err(e) = result {
         eprintln!("error: {e:#}");
         let code = if e.to_string().contains("character model") { 3 } else { 1 };
@@ -697,6 +710,259 @@ fn read_bsp(dir: &Path, stem: &str) -> Result<(rbsp::Bsp, BTreeMap<String, Vec<u
     Ok((bsp, parts))
 }
 
+/// The map's client BSP, extracted from its paks by RSX. `reuse` keeps the last extraction when
+/// it is still on disk (the collision-only pass doesn't need a fresh one).
+fn extract_bsp(paks: &Paks, stem: &str, reuse: bool) -> Result<(rbsp::Bsp, BTreeMap<String, Vec<u8>>)> {
+    eprintln!("== bsp");
+    let bsp_dir = paks.cfg.work.join("bsp").join(stem);
+    let maps = bsp_dir.join("wrap").join("maps");
+    if reuse && maps.join(format!("{stem}.bsp")).is_file() {
+        eprintln!("  reusing {}", maps.display());
+        return read_bsp(&maps, stem);
+    }
+    let _ = std::fs::remove_dir_all(&bsp_dir);
+    let client: Vec<&PathBuf> = [format!("{stem}_client_perm.rpak"), format!("{stem}_client_temp.rpak")]
+        .iter()
+        .filter_map(|b| paks.load.get(b))
+        .collect();
+    if client.is_empty() {
+        bail!("the install has no client map paks for {stem}");
+    }
+    let mut a: Vec<std::ffi::OsString> =
+        vec!["-export".into(), "--exporttypes".into(), "wrap".into(), "--exportdir".into(), bsp_dir.clone().into()];
+    a.extend(client.iter().map(|p| p.as_os_str().to_owned()));
+    assets::run_rsx(&paks.cfg, &a, &bsp_dir)?;
+    read_bsp(&maps, stem)
+}
+
+/// `--collision`: rewrite only `collision.bin` (and print what the decode found).
+fn export_collision_cmd(args: &Args, cfg: Config) -> Result<()> {
+    let t0 = Instant::now();
+    let stem = args.map.clone();
+    let out_dir = args.out.clone().unwrap_or_else(|| mapcache_root().join(&stem));
+    eprintln!("== paks");
+    let paks = Paks::open(cfg, &pak_set(&stem))?;
+    let map_pak = format!("{stem}.rpak");
+    let prefer = [map_pak.as_str(), "common_mp.rpak", "common.rpak", "common_early.rpak", "common_flowstate.rpak"];
+    let (bsp, _) = extract_bsp(&paks, &stem, true)?;
+    std::fs::create_dir_all(&out_dir)?;
+    write_collision(&bsp, &paks, &prefer, &out_dir, true, args.prop_physics)?;
+    eprintln!("done in {:.1}s", t0.elapsed().as_secs_f32());
+    Ok(())
+}
+
+fn tree_of<'a>(bsp: &'a rbsp::Bsp, m: &rbsp::lumps::collision::Model, masks: &'a [u32]) -> coll::Tree<'a> {
+    coll::Tree {
+        nodes: bsp.lump(rbsp::ids::BVH_NODES),
+        node_base: m.bvh_node.max(0) as usize,
+        leaf: bsp.lump(rbsp::ids::BVH_LEAF_DATA),
+        leaf_base: m.bvh_leaf.max(0) as usize,
+        verts: bsp.lump(rbsp::ids::VERTICES).get(m.vert_index.max(0) as usize * 12..).unwrap_or(&[]),
+        origin: Vec3::from(m.origin),
+        scale: m.decode_scale * 65536.0,
+        masks,
+    }
+}
+
+/// Decodes the map's collision (world tree + static prop models) into `<out>/collision.bin`.
+fn write_collision(bsp: &rbsp::Bsp, paks: &Paks, prefer: &[&str], out_dir: &Path, verbose: bool, prop_physics: bool) -> Result<()> {
+    use rbsp::lumps::collision as c;
+    let t0 = Instant::now();
+    let v = bsp.version_kind().ok_or_else(|| anyhow!("unknown map version"))?;
+    let models = c::parse_models(bsp.lump(rbsp::ids::MODELS), v).map_err(|e| anyhow!("models: {e}"))?;
+    let masks: Vec<u32> =
+        c::parse_content_masks(bsp.lump(rbsp::ids::CONTENTS_MASKS), v).map_err(|e| anyhow!("masks: {e}"))?.iter().map(|m| m.mask).collect();
+    let mut soup = coll::Soup::default();
+    let mut src_tris = [0usize; 4];
+    let mut mask_hist: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut outside = 0usize;
+
+    // Brush models other than the world belong to entities (triggers, movers, func_brush):
+    // reported, not baked into the static soup.
+    if verbose {
+        for (i, m) in models.iter().enumerate().skip(1) {
+            if !(m.bvh_node >= 0 && m.mins[0] <= m.maxs[0]) {
+                continue;
+            }
+            let d = tree_of(bsp, m, &masks).decode();
+            let ms: BTreeSet<u32> = d.tris.iter().map(|t| t.1).collect();
+            let ms: Vec<String> = ms.iter().map(|m| format!("{m:#x}")).collect();
+            eprintln!("  model {i}: {} tris, {} prop leaves, masks {ms:?}", d.tris.len(), d.props.len());
+        }
+    }
+
+    let m0 = models.first().copied().ok_or_else(|| anyhow!("the map has no models"))?;
+    let world = tree_of(bsp, &m0, &masks).decode();
+    eprintln!(
+        "  world tree: {} nodes, leaves by kind {:?}, triangles by kind {:?}, {} prop leaves, {} bad refs",
+        world.stats.nodes_visited,
+        world.stats.leaves_by_kind,
+        world.stats.tris_by_kind,
+        world.props.len(),
+        world.stats.bad_refs
+    );
+    if verbose {
+        // Cross-check against r5ed's own decoder.
+        match rcomp::collision::decode_leaves(bsp, 0) {
+            Ok(l) => eprintln!("  r5ed decode_leaves(0): {} leaves, {} triangles", l.len(), l.iter().map(|x| x.triangles.len()).sum::<usize>()),
+            Err(e) => eprintln!("  r5ed decode_leaves(0): {e}"),
+        }
+    }
+    let (lo, hi) = (Vec3::from(m0.mins) - 1.0, Vec3::from(m0.maxs) + 1.0);
+    for (t, mask, src) in &world.tris {
+        // The vertex pool opens with a padding record a few entries name: drop what lies
+        // outside the model's own box (r5ed does the same).
+        if !t.iter().all(|p| p.is_finite() && p.cmpge(lo).all() && p.cmple(hi).all()) {
+            outside += 1;
+            continue;
+        }
+        let before = soup.idx.len();
+        soup.push(*t, *mask, *src);
+        if soup.idx.len() > before {
+            src_tris[*src as usize] += 1;
+            *mask_hist.entry(*mask).or_default() += 1;
+        }
+    }
+
+    // Static props named by prop leaves, each with its model's own collision tree.
+    let sprp = match rbsp::lumps::parse_at(rbsp::ids::GAME_LUMP, v, bsp.lump(rbsp::ids::GAME_LUMP), 0) {
+        Ok(rbsp::Lump::GameLump(gl)) => gl.static_props().cloned(),
+        _ => None,
+    };
+    let (mut placed, mut no_file, mut no_bvh) = (0usize, 0usize, 0usize);
+    if let Some(sp) = &sprp {
+        let mut by_model: BTreeMap<String, Vec<coll::PropRef>> = BTreeMap::new();
+        let mut leaf_masks: BTreeMap<u32, usize> = BTreeMap::new();
+        for r in &world.props {
+            *leaf_masks.entry(r.mask).or_default() += 1;
+            if let Some(m) = sp.model_of(r.index as usize) {
+                by_model.entry(m.replace('\\', "/").to_ascii_lowercase()).or_default().push(*r);
+            }
+        }
+        let leaf_masks: Vec<String> = leaf_masks.iter().map(|(m, n)| format!("{m:#x} x{n}")).collect();
+        eprintln!("  prop leaves name {} static props over {} models; leaf masks {leaf_masks:?}", world.props.len(), by_model.len());
+        if verbose {
+            // Props the BSP keeps away from player traces (no PLAYERCLIP/SOLID bit on their leaf).
+            let mut ghost: Vec<(usize, usize, &String)> = by_model
+                .iter()
+                .map(|(n, r)| (r.iter().filter(|x| x.mask & coll::MASK_PLAYERSOLID == 0).count(), r.len(), n))
+                .filter(|x| x.0 > 0)
+                .collect();
+            ghost.sort_by(|a, b| b.0.cmp(&a.0));
+            let shown: Vec<String> = ghost.iter().take(14).map(|(g, n, m)| format!("{m} {g}/{n}")).collect();
+            eprintln!("  props players pass through (leaf has no player bits), top models: {shown:?}");
+        }
+        let wanted: BTreeSet<String> = by_model.keys().cloned().collect();
+        let files = load_model_files(paks, &wanted, prefer)?;
+        let mut space_checks = 0usize;
+        let mut costs: Vec<(usize, usize, usize, usize, String)> = Vec::new();
+        let mut tree_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (name, refs) in &by_model {
+            let Some((rmdl, _)) = files.get(name) else {
+                no_file += refs.len();
+                if verbose {
+                    eprintln!("    {name}: no model file ({} props)", refs.len());
+                }
+                continue;
+            };
+            let (main_tree, physics) = match coll::rmdl_collision(rmdl) {
+                Ok(Some(trees)) if trees.iter().any(|t| !t.tris.is_empty()) => {
+                    let pi = coll::physics_tree_index(rmdl);
+                    *tree_counts.entry(format!("{} trees, physics index {pi:?}", trees.len())).or_default() += 1;
+                    coll::split_trees(trees, pi)
+                }
+                Ok(_) => {
+                    no_bvh += refs.len();
+                    if verbose {
+                        let ps = refs.iter().filter(|r| r.mask & coll::MASK_PLAYERSOLID != 0).count();
+                        eprintln!("    {name}: no bvh collision ({} props, {ps} with a player-solid leaf)", refs.len());
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    no_bvh += refs.len();
+                    eprintln!("    {name}: {e}");
+                    continue;
+                }
+            };
+            let main_tree = main_tree.unwrap_or_else(|| coll::Decoded { tris: Vec::new(), props: Vec::new(), stats: Default::default() });
+            let phys_n = physics.as_ref().map_or(0, |d| d.tris.len());
+            if verbose && space_checks < 6 {
+                // The trees should sit inside the studiohdr hull (the axes a map places it on).
+                let (blo, bhi) =
+                    main_tree.tris.iter().flat_map(|t| t.0).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p)));
+                if let Some((hlo, hhi)) = coll::rmdl_hull(rmdl) {
+                    eprintln!(
+                        "    {name}: collision tree {} tris box {blo:.0}..{bhi:.0}, physics tree {phys_n} tris, studiohdr hull {hlo:.0}..{hhi:.0}",
+                        main_tree.tris.len()
+                    );
+                }
+                space_checks += 1;
+            }
+            costs.push((main_tree.tris.len() * refs.len(), main_tree.tris.len(), phys_n, refs.len(), name.clone()));
+            let mut trees: Vec<(&coll::Decoded, u8)> = vec![(&main_tree, coll::SRC_PROP)];
+            if prop_physics {
+                if let Some(d) = &physics {
+                    trees.push((d, coll::SRC_PROP_PHYSICS));
+                }
+            }
+            for r in refs {
+                let rec = sp.props[r.index as usize];
+                let scale = if rec.scale > 0.0 { rec.scale } else { 1.0 };
+                let (o, q) = (Vec3::from(rec.origin), source_rot(Vec3::from(rec.angles)));
+                for (tree, src) in &trees {
+                    for (t, mask, _) in &tree.tris {
+                        let m = coll::prop_contents(r.mask, *mask);
+                        let before = soup.idx.len();
+                        soup.push(coll::place(t, o, q, scale), m, *src);
+                        if soup.idx.len() > before {
+                            src_tris[*src as usize] += 1;
+                            *mask_hist.entry(m).or_default() += 1;
+                        }
+                    }
+                }
+                placed += 1;
+            }
+        }
+        eprintln!("  prop models by tree count: {tree_counts:?}");
+        if verbose {
+            costs.sort_by(|a, b| b.0.cmp(&a.0));
+            eprintln!("  heaviest prop models (collision tris x copies):");
+            for (total, tris, phys_n, n, name) in costs.iter().take(10) {
+                eprintln!("    {total:>8}: {tris:>6} tris (physics {phys_n:>4}) x {n:>4}  {name}");
+            }
+        }
+    }
+    let (blo, bhi) = soup.bounds();
+    let solid = soup.mask.iter().filter(|m| **m & coll::MASK_PLAYERSOLID != 0).count();
+    let mut top: Vec<(&u32, &usize)> = mask_hist.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1));
+    let top: Vec<String> = top
+        .iter()
+        .take(16)
+        .map(|(m, n)| format!("{m:#x}{} x{n}", if **m & coll::MASK_PLAYERSOLID != 0 { "" } else { " (not player-solid)" }))
+        .collect();
+    let bytes = soup.to_bytes();
+    std::fs::write(out_dir.join("collision.bin"), &bytes)?;
+    eprintln!(
+        "  collision.bin: {} tris ({} world poly, {} world hull, {} static prop, {} prop physics tree), {} verts, {:.1} MB, {solid} player-solid; dropped {outside} outside the world box, {} degenerate",
+        soup.idx.len(),
+        src_tris[0],
+        src_tris[1],
+        src_tris[2],
+        src_tris[3],
+        soup.pos.len(),
+        bytes.len() as f64 / 1e6,
+        soup.degenerate
+    );
+    eprintln!(
+        "  props: {placed} placed, {no_file} without a model file, {no_bvh} without bvh collision; bounds {blo:.0}..{bhi:.0}; {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
+    eprintln!("  masks: {top:?}");
+    Ok(())
+}
+
 fn kv_vec3(e: &rbsp::lumps::entities::Entity, k: &str) -> Option<Vec3> {
     let v: Vec<f32> = e.get(k)?.split_whitespace().filter_map(|s| s.parse().ok()).collect();
     (v.len() >= 3).then(|| Vec3::new(v[0], v[1], v[2]))
@@ -722,21 +988,7 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
     let map_pak = format!("{stem}.rpak");
     let prefer = [map_pak.as_str(), "common_mp.rpak", "common.rpak", "common_early.rpak", "common_flowstate.rpak"];
 
-    eprintln!("== bsp");
-    let bsp_dir = paks.cfg.work.join("bsp").join(&stem);
-    let _ = std::fs::remove_dir_all(&bsp_dir);
-    let client: Vec<&PathBuf> = [format!("{stem}_client_perm.rpak"), format!("{stem}_client_temp.rpak")]
-        .iter()
-        .filter_map(|b| paks.load.get(b))
-        .collect();
-    if client.is_empty() {
-        bail!("the install has no client map paks for {stem}");
-    }
-    let mut a: Vec<std::ffi::OsString> =
-        vec!["-export".into(), "--exporttypes".into(), "wrap".into(), "--exportdir".into(), bsp_dir.clone().into()];
-    a.extend(client.iter().map(|p| p.as_os_str().to_owned()));
-    assets::run_rsx(&paks.cfg, &a, &bsp_dir)?;
-    let (bsp, parts) = read_bsp(&bsp_dir.join("wrap").join("maps"), &stem)?;
+    let (bsp, parts) = extract_bsp(&paks, &stem, false)?;
     let version = bsp.version_kind().ok_or_else(|| anyhow!("unknown map version {}", bsp.version()))?;
     eprintln!("  rBSP v{} ({version:?}), {} lumps, partitions {:?}", bsp.version(), bsp.lumps.len(), parts.keys().collect::<Vec<_>>());
 
@@ -1177,6 +1429,8 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
         "seconds": t0.elapsed().as_secs_f32(),
     });
     std::fs::write(out_dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+    eprintln!("== collision");
+    write_collision(&bsp, &paks, &prefer, &out_dir, false, args.prop_physics)?;
     eprintln!(
         "done in {:.0}s: world.glb {:.1} MB, {} draw calls, {} materials, {} images, {tris} triangles, {prop_count} static props",
         t0.elapsed().as_secs_f32(),
