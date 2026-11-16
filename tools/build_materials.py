@@ -70,7 +70,10 @@ for m in j['materials']:
                 imgs = [g]
         if imgs: slots[t] = imgs[0]
     CANON = {'albedo': ['albedoTexture', 'col'], 'normal': ['normalTexture', 'nml'], 'gloss': ['glossTexture', 'gls'],
-             'spec': ['specTexture', 'spc'], 'ao': ['aoTexture', 'ao'], 'emissive': ['emissiveTexture', 'ilm']}
+             'spec': ['specTexture', 'spc'], 'ao': ['aoTexture', 'ao'], 'emissive': ['emissiveTexture', 'ilm'],
+             # second layer of two-layer blend materials + blend mask + layer-0 detail normal
+             'albedo2': ['albedo2Texture'], 'normal2': ['normal2Texture'], 'gloss2': ['gloss2Texture'], 'spec2': ['spec2Texture'],
+             'blend': ['layerBlendTexture', 'bm'], 'detail_normal': ['detailNormalTexture']}
     canon = {k: next((slots[a] for a in alts if a in slots), None) for k, alts in CANON.items()}
     # per-material constants (CBufUberStatic, exported as text next to the JSON): L0 albedo + emissive tints
     tints = {}
@@ -84,6 +87,19 @@ for m in j['materials']:
             for key, field in (('albedo_tint', 'L0_albedoTint'), ('emissive_tint', 'L0_emissiveTint')):
                 if nm.endswith(field):
                     tints[key] = vals[-3:] if 'And' in nm else vals[:3]
+        for line in open(up, encoding='utf-8', errors='ignore'):
+            mt = re.search(r'float (c_\w+)(?:\[\d\])? = (\{[^}]*\}|[-0-9.e]+);', line)
+            if mt:
+                nm, raw = mt.group(1), mt.group(2).strip('{} ')
+                vals = [float(x) for x in raw.split(',')]
+                if nm == 'c_layerBlendRamp': tints['blend_ramp'] = vals[0]
+                elif nm == 'c_L0_perfGlossAndL1_albedoTint': tints['perf_gloss'] = vals[0]; tints['albedo2_tint'] = vals[1:4]
+                elif nm == 'c_L1_perfGlossAndL1_emissiveTint': tints['perf_gloss2'] = vals[0]
+                elif nm == 'c_L1_perfSpecColorAndSplineMinPixelPercent': tints['perf_spec2'] = vals[:3]
+                elif nm in ('c_L0_perfSpecColorX', 'c_L0_perfSpecColorY', 'c_L0_perfSpecColorZ'):
+                    tints.setdefault('perf_spec', [0.04, 0.04, 0.04])['XYZ'.index(nm[-1])] = vals[0]
+                elif nm in ('c_uv1RotScaleX', 'c_uv1RotScaleY', 'c_uv1Translate', 'c_uv2RotScaleX', 'c_uv2RotScaleY', 'c_uv2Translate'):
+                    tints[nm[2:]] = vals[:2]
         for line in open(up, encoding='utf-8', errors='ignore'):
             mt = re.search(r'float c_emissiveEdgeFade(Exponent|Inner|Outer) = ([-0-9.e]+);', line)
             if mt:

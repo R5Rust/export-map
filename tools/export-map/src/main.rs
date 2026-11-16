@@ -812,6 +812,11 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
     let flip_world = agree * 2 < total;
     eprintln!("  winding: {agree}/{total} triangles counter-clockwise -> {}", if flip_world { "flipping" } else { "kept" });
     for (mi, r) in runs.iter().enumerate() {
+        if std::env::var_os("EXPORT_MAP_DUMP_SAND").is_some() && r.material.contains("sand_desert_02") {
+            let a: Vec<u8> = r.colors.iter().map(|c| c[3]).collect();
+            let lo = a.iter().filter(|&&x| x < 64).count();
+            eprintln!("  RUN {mi} {} vtype {} flags {:#x} verts {} alpha<64 {}", r.material, r.vertex_type, r.flags, a.len(), lo);
+        }
         if mats::is_hidden_material(&r.material) {
             skipped_tools += r.indices.len() / 3;
             continue;
