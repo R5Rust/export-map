@@ -104,6 +104,12 @@ for m in j['materials']:
             mt = re.search(r'float c_emissiveEdgeFade(Exponent|Inner|Outer) = ([-0-9.e]+);', line)
             if mt:
                 tints.setdefault('emissive_edge', [0.0, 1.0, 1.0])[('Exponent', 'Inner', 'Outer').index(mt.group(1))] = float(mt.group(2))
+    # old-style translucent blends (_col/_nml/_gls + an unnamed or _bm 4th slot): the 4th slot is the blend mask
+    old_style = 'col' in slots
+    if old_style and not canon.get('blend') and m.get('alphaMode') == 'BLEND' and 'unavailable' in slots:
+        canon['blend'] = slots['unavailable']
+    if old_style:
+        tints['old_style'] = True
     out[name] = {'shader': found.get('shaderType'), **{k: v for k, v in canon.items() if v}, **tints, 'all': slots}
 json.dump(out, open(os.path.join(mdir, 'materials.json'), 'w'), indent=1)
 from collections import Counter
