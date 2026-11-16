@@ -128,6 +128,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bcdec_rs",
+ "bytemuck",
  "glam",
  "image",
  "rayon",
