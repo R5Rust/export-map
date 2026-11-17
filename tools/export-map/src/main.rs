@@ -829,6 +829,17 @@ fn write_collision(bsp: &rbsp::Bsp, paks: &Paks, prefer: &[&str], out_dir: &Path
         Ok(rbsp::Lump::GameLump(gl)) => gl.static_props().cloned(),
         _ => None,
     };
+    // debug: R5_PROPS_AT=x,y lists the static props within 2500u of that point (flags study)
+    if let (Some(sp), Ok(at)) = (&sprp, std::env::var("R5_PROPS_AT")) {
+        let c: Vec<f32> = at.split(',').filter_map(|v| v.parse().ok()).collect();
+        for (i, p) in sp.props.iter().enumerate() {
+            let (dx, dy) = (p.origin[0] - c[0], p.origin[1] - c[1]);
+            if dx * dx + dy * dy < 2500.0 * 2500.0 {
+                eprintln!("PROP {i:5} {:60} o ({:7.0},{:7.0},{:6.0}) s {:.2} solid {} flags {:#04x} u2 {} u3 {} u4 {:.1} u5 {:#x} u6 {:#x} u7 {:#x} dm {:#x} wind {:#x} sd {} u8 {:?}",
+                    sp.model_of(i).unwrap_or("?"), p.origin[0], p.origin[1], p.origin[2], p.scale, p.unknown_0, p.unknown_1, p.unknown_2, p.unknown_3, p.unknown_4, p.unknown_5, p.unknown_6, p.unknown_7, p.diffuse_modulation, p.wind_data, p.setdress_level, p.unknown_8);
+            }
+        }
+    }
     let (mut placed, mut no_file, mut no_bvh) = (0usize, 0usize, 0usize);
     if let Some(sp) = &sprp {
         let mut by_model: BTreeMap<String, Vec<coll::PropRef>> = BTreeMap::new();
@@ -1046,6 +1057,20 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
     };
     let lightmaps = if args.lightmaps { build_lightmap_atlas(&bsp, &lm_headers)? } else { None };
 
+    // debug: R5_MESHFLAGS=1 prints the render mesh flag values (with an example material each), then stops
+    if std::env::var_os("R5_MESHFLAGS").is_some() {
+        let mut h: BTreeMap<u32, (usize, BTreeSet<String>)> = BTreeMap::new();
+        for r in &runs {
+            let e = h.entry(r.flags).or_default();
+            e.0 += r.indices.len() / 3;
+            if e.1.len() < 6 { e.1.insert(r.material.clone()); }
+        }
+        for (f, (n, m)) in &h { eprintln!("MESHFLAGS {f:#010x} tris {n:8} e.g. {m:?}"); }
+        for r in runs.iter().filter(|r| r.material.contains("world_foundry_trims_01")) {
+            eprintln!("TRIMS flags {:#010x} model {} bounds {:?}..{:?}", r.flags, r.model, r.bounds_min, r.bounds_max);
+        }
+        return Ok(());
+    }
     let mut groups = Groups::default();
     let mut world_names: BTreeSet<String> = BTreeSet::new();
     let (mut skipped_tools, mut skipped_sky) = (0usize, 0usize);
