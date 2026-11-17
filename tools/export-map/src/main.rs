@@ -359,7 +359,9 @@ fn color_key(info: &mats::MatInfo, g: u64, cap: u32) -> mats::ImgKey {
     if info.translucent {
         (g, Role::Blend, cap, info.opacity.unwrap_or(0))
     } else {
-        (g, Role::Color, cap, 0)
+        // cut-outs whose alpha lives in a separate opacityMultiplyTexture / _msk (e.g. the habitat pine branches'
+        // skin) get it multiplied in, like blended materials
+        (g, Role::Color, cap, info.opacity.unwrap_or(0))
     }
 }
 

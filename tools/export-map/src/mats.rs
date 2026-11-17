@@ -143,7 +143,7 @@ fn build_one(dir: &Path, work: &Path, k: &ImgKey) -> Result<()> {
     }
     let (path, _) = tex::pick_mip(&mips, cap)?;
     let mut img = tex::decode_dds(&std::fs::read(&path)?, role)?.fit(cap);
-    if role == Role::Blend && mask != 0 {
+    if (role == Role::Blend || role == Role::Color) && mask != 0 {
         let mm = tex::mips_of(dir, mask);
         if !mm.is_empty() {
             let (mp, _) = tex::pick_mip(&mm, cap)?;
