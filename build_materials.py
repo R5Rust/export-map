@@ -208,6 +208,11 @@ for m in j['materials']:
         rot_to_affine(tints, n)
     if route:
         tints['uv_route'] = {k: route[a] for k, alts in CANON.items() for a in alts if a in route}
+    # render state the client needs: rasterizerFlags & 0x70 picks the depth bias class (0x10 = decal, docs/apex-lighting.md 9),
+    # depthStencilFlags bit 0 depth test, bits 1-3 compare, bit 4 depth write
+    for key, field in (('raster_flags', 'rasterizerFlags'), ('depth_flags', 'depthStencilFlags')):
+        if isinstance(found.get(field), str):
+            tints[key] = int(found[field], 16)
     out[name] = {'shader': found.get('shaderType'), **{k: v for k, v in canon.items() if v}, **tints, 'all': slots}
 json.dump(out, open(os.path.join(mdir, 'materials.json'), 'w'), indent=1)
 from collections import Counter
