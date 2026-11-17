@@ -34,18 +34,24 @@ struct Args {
     models: Vec<String>,
     out: Option<PathBuf>,
     world_cap: u32,
-    prop_cap: u32,
+    /// None = same as `world_cap`, so props and world surfaces get the same texture ceiling
+    prop_cap: Option<u32>,
     normals: bool,
     lightmaps: bool,
     clean: bool,
     prop_tri_budget: usize,
     collision_only: bool,
     prop_physics: bool,
+    /// Old behaviour: props outside the play area use the game's lower LODs by distance.
+    far_lods: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: export-map [map] [--model <mdl/..rmdl>] [--out <dir>] [--tex <px>] [--prop-tex <px>] [--prop-tris <n>] [--no-normals] [--no-lightmap] [--clean] [--collision] [--prop-physics]\n\
+        "usage: export-map [map] [--model <mdl/..rmdl>] [--out <dir>] [--tex <px>] [--prop-tex <px>] [--prop-tris <n>] [--far-lods] [--no-normals] [--no-lightmap] [--clean] [--collision] [--prop-physics]\n\
+         --tex <px> (default 4096) caps world textures, --prop-tex <px> props (default: same as --tex)
+         --prop-tris <n>: triangle budget for all static props (default 16000000); over it, the models costing the most
+         drop one of the game's LODs at a time, every copy alike. --far-lods: old distance rings (lower LODs outside the play area)
          --collision: only (re)write collision.bin, reusing the BSP the last export extracted\n\
          --prop-physics: also write static props' physics trees into collision.bin (source 3)\n\
          env: R5_GAME_ROOT (default {DEFAULT_GAME}), R5_RSX (default the r5ed bundle's rsx.exe), R5_EXPORT_WORK (default %TEMP%\\r5-export-map)"
@@ -54,14 +60,15 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { map: DEFAULT_MAP.into(), models: Vec::new(), out: None, world_cap: 1024, prop_cap: 512, normals: true, lightmaps: true, clean: false, prop_tri_budget: 5_500_000, collision_only: false, prop_physics: false };
+    let mut a = Args { map: DEFAULT_MAP.into(), models: Vec::new(), out: None, world_cap: 4096, prop_cap: None, normals: true, lightmaps: true, clean: false, prop_tri_budget: 16_000_000, collision_only: false, prop_physics: false, far_lods: false };
     let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
             "--model" => a.models.push(it.next().unwrap_or_else(|| usage())),
             "--out" => a.out = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--tex" => a.world_cap = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
-            "--prop-tex" => a.prop_cap = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
+            "--prop-tex" => a.prop_cap = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
+            "--far-lods" => a.far_lods = true,
             "--no-normals" => a.normals = false,
             "--prop-tris" => a.prop_tri_budget = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--no-lightmap" => a.lightmaps = false,
@@ -575,7 +582,7 @@ fn models_to_glbs(paks: &Paks, paths: &BTreeSet<String>, args: &Args, prefer: &[
         per.push((path.clone(), groups));
     }
     let infos = mats::resolve(paks, &mat_guids)?;
-    let plans: Vec<BTreeMap<String, MatPlan>> = per.iter().map(|(_, g)| model_plans(g, &infos, paks, args.prop_cap)).collect();
+    let plans: Vec<BTreeMap<String, MatPlan>> = per.iter().map(|(_, g)| model_plans(g, &infos, paks, args.prop_cap.unwrap_or(args.world_cap))).collect();
     let mut wanted = BTreeSet::new();
     for p in &plans {
         wanted.extend(wanted_images(p, args.normals));
@@ -614,7 +621,7 @@ fn move_tree(from: &Path, to: &Path) -> Result<()> {
 /// by `scale`, then `rot`, then `origin` (the rmdl vertex blocks are already on
 /// the axes a map places them on).
 fn add_model(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Vec3, rot: Quat, scale: f32, mats_out: &mut BTreeSet<u64>) {
-    add_model_flip(groups, model, origin, rot, scale, mats_out, model_needs_flip(model), None, "")
+    add_model_flip(groups, model, origin, rot, scale, mats_out, model_needs_flip(model), None, "", None)
 }
 
 /// The studiohdr skin table: `numskinref` (+148), `numskinfamilies` (+150) and `skinindex` (+152,
@@ -657,8 +664,9 @@ fn model_needs_flip(model: &rpak::rmdl::RmdlModel) -> bool {
 
 /// `skin`: a material-slot remap from `skin_remap`. `suffix` is appended to the group key
 /// ("|ns" no shadow, "|sky" 3D skybox) so such geometry keeps its own primitives and material.
+/// `lighting`: the instance's packed light probe + cubemap (see `gltf::Prim::lighting`), written on every vertex.
 #[allow(clippy::too_many_arguments)]
-fn add_model_flip(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Vec3, rot: Quat, scale: f32, mats_out: &mut BTreeSet<u64>, flip: bool, skin: Option<&[u16]>, suffix: &str) {
+fn add_model_flip(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Vec3, rot: Quat, scale: f32, mats_out: &mut BTreeSet<u64>, flip: bool, skin: Option<&[u16]>, suffix: &str, lighting: Option<u32>) {
     for m in &model.meshes {
         let slot = skin.and_then(|s| s.get(m.material as usize)).map_or(m.material as usize, |t| *t as usize);
         let guid = model.textures.get(slot).or_else(|| model.textures.get(m.material as usize)).copied().unwrap_or(0);
@@ -674,6 +682,9 @@ fn add_model_flip(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Ve
             p.normals.push((rot * Vec3::from(m.normals[i])).normalize_or_zero().to_array());
             p.uv0.push(m.uv0[i]);
             p.colors.push(m.colors.get(i).copied().unwrap_or([255; 4]));
+            if let Some(l) = lighting {
+                p.lighting.push(l);
+            }
         }
         for t in m.indices.chunks_exact(3) {
             if flip {
@@ -1274,9 +1285,13 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
             .collect();
         eprintln!("  {n} props over {} models", wanted.len());
         let files = load_model_files(&paks, &wanted, &prefer)?;
-        // LOD by distance from the play area: full detail where players go,
-        // the game's own lower LODs for the backdrop.
+        // LOD0 for every prop by default, so detail is the same wherever you fly (r5rust has no runtime LOD switching).
+        // `--far-lods`: the old distance rings, the game's own lower LODs for the backdrop outside the play area.
+        let far_lods = args.far_lods;
         let lod_for = |o: Vec3| -> usize {
+            if !far_lods {
+                return 0;
+            }
             let d = play_area.map_or(0.0, |(lo, hi): (Vec3, Vec3)| {
                 let dx = (lo.x - o.x).max(o.x - hi.x).max(0.0);
                 let dy = (lo.y - o.y).max(o.y - hi.y).max(0.0);
@@ -1333,13 +1348,21 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
             hist[(*l).min(5)] += 1;
         }
         eprintln!(
-            "  play-area props: {all_lod0} triangles at LOD0 -> {total} under the {} budget (models per base LOD: {hist:?})",
+            "  {} props: {all_lod0} triangles at LOD0 -> {total} under the {} budget (models per base LOD: {hist:?})",
+            if far_lods { "play-area" } else { "all" },
             args.prop_tri_budget
         );
+        let mut dropped: Vec<(&String, &usize)> = base_lod.iter().filter(|(_, l)| **l > 0).collect();
+        dropped.sort();
+        for (k, l) in dropped {
+            eprintln!("    LOD{l} for all {} copies of {k} ({} -> {} triangles each)", copies[k], lod_tris_of[k][0], lod_tris_of[k][*l]);
+        }
         let mut parsed: HashMap<(String, usize), Option<(rpak::rmdl::RmdlModel, bool)>> = HashMap::new();
         let mut lod_tris = [0usize; 8];
         let mut skinned = 0usize;
         let mut flag_hist: BTreeMap<&str, usize> = BTreeMap::new();
+        let prop_probes = bsp.lump(0x66);
+        let mut no_probe = 0usize;
         for i in 0..n {
             let rec = sp.props[i];
             let Some(name) = sp.model_of(i).map(|m| m.replace('\\', "/").to_ascii_lowercase()) else { continue };
@@ -1372,10 +1395,19 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
                 skinned += 1;
             }
             *flag_hist.entry(pflags.suffix()).or_default() += 1;
-            add_model_flip(&mut groups, model, Vec3::from(rec.origin), source_rot(Vec3::from(rec.angles)), scale, &mut prop_mat_guids, *flip, skin.as_deref(), pflags.suffix());
+            // The game lights a static prop from its own baked probe: LUMP_STATIC_PROP_LIGHTPROBE_INDEX (0x66) holds
+            // one probe index per prop record (probes 0..N of lump 0x65 are these per-prop probes, baked at the
+            // prop's (lighting) origin; the k-d tree in 0x67/0x68 only references the rest). Its env cubemap is
+            // record halfword 3. docs/apex-lighting.md section 6.
+            let lighting = prop_probes.get(i * 4..i * 4 + 4).map(|b| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0xFF_FFFF) | ((rec.unknown_3 as u32 & 0xFF) << 24));
+            if lighting.is_none() {
+                no_probe += 1;
+            }
+            add_model_flip(&mut groups, model, Vec3::from(rec.origin), source_rot(Vec3::from(rec.angles)), scale, &mut prop_mat_guids, *flip, skin.as_deref(), pflags.suffix(), lighting);
             prop_count += 1;
         }
         eprintln!("  prop triangles by LOD: {:?}", &lod_tris[..4]);
+        eprintln!("  per-prop light probes (lump 0x66): {} entries, {no_probe} props without one", prop_probes.len() / 4);
         eprintln!("  props by placement (''=normal, |ns=no shadow, |sky=3D skybox): {flag_hist:?}; {skinned} drawn with a non-default skin");
         let fixed: BTreeSet<&str> =
             parsed.iter().filter(|(_, v)| v.as_ref().is_some_and(|(m, _)| m.surface_prop.ends_with("|axes-fixed"))).map(|(k, _)| k.0.as_str()).collect();
@@ -1401,7 +1433,7 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
     let mut all_guids: BTreeSet<u64> = world_guid.values().copied().collect();
     all_guids.extend(prop_mat_guids.iter().copied());
     let infos = mats::resolve(&paks, &all_guids)?;
-    let mut plans = model_plans(&groups, &infos, &paks, args.prop_cap);
+    let mut plans = model_plans(&groups, &infos, &paks, args.prop_cap.unwrap_or(args.world_cap));
     let lm_index = lightmaps.as_ref().map(|_| ());
     for key in &groups.keys {
         let Some(rest) = key.strip_prefix("w:") else { continue };
@@ -1554,6 +1586,14 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
     // ---- write
     eprintln!("== write");
     std::fs::create_dir_all(&out_dir)?;
+    // Keep the previous export one generation back (world.prev.glb, meta.prev.json, collision.prev.bin).
+    for (cur, prev) in [("world.glb", "world.prev.glb"), ("meta.json", "meta.prev.json"), ("collision.bin", "collision.prev.bin")] {
+        if out_dir.join(cur).is_file() {
+            let _ = std::fs::remove_file(out_dir.join(prev));
+            std::fs::rename(out_dir.join(cur), out_dir.join(prev)).with_context(|| format!("backing up {cur}"))?;
+            eprintln!("  previous {cur} kept as {prev}");
+        }
+    }
     let (glb, draw_calls) = gltf::write(
         &prims,
         &materials,

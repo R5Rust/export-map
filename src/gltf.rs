@@ -15,6 +15,9 @@ pub struct Prim {
     pub uv1: Vec<[f32; 2]>,
     /// Vertex colours (RGBA8); empty when unused.
     pub colors: Vec<[u8; 4]>,
+    /// Static props only: the instance's baked lighting, per vertex (r5rust's `_LIGHTING` attribute):
+    /// light probe index (LUMP 0x66) in bits 0-23, env cubemap index (record halfword 3) in bits 24-31.
+    pub lighting: Vec<u32>,
     pub indices: Vec<u32>,
 }
 
@@ -184,6 +187,7 @@ fn split_u16(p: &Prim) -> Vec<Prim> {
             uv0: p.uv0.clone(),
             uv1: p.uv1.clone(),
             colors: p.colors.clone(),
+            lighting: p.lighting.clone(),
             indices: p.indices.clone(),
         }];
     }
@@ -216,6 +220,9 @@ fn split_u16(p: &Prim) -> Vec<Prim> {
                 }
                 if p.colors.len() == p.positions.len() {
                     cur.colors.push(p.colors[k]);
+                }
+                if p.lighting.len() == p.positions.len() {
+                    cur.lighting.push(p.lighting[k]);
                 }
                 (cur.positions.len() - 1) as u32
             });
@@ -270,6 +277,13 @@ fn write_prim(bin: &mut Bin, accessors: &mut Vec<Value>, p: &Prim, material: usi
         let v = bin.push(&b, Some(34962));
         accessors.push(json!({"bufferView": v, "componentType": 5121, "normalized": true, "count": n, "type": "VEC4"}));
         attrs.insert("COLOR_0".into(), json!(accessors.len() - 1));
+    }
+    if p.lighting.len() == n {
+        // application-specific attribute (leading underscore), u32 scalar
+        let b: Vec<u8> = p.lighting.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let v = bin.push(&b, Some(34962));
+        accessors.push(json!({"bufferView": v, "componentType": 5125, "count": n, "type": "SCALAR"}));
+        attrs.insert("_LIGHTING".into(), json!(accessors.len() - 1));
     }
     let ib: Vec<u8> = p.indices.iter().flat_map(|i| (*i as u16).to_le_bytes()).collect();
     let iv = bin.push(&ib, Some(34963));
