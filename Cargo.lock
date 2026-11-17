@@ -393,6 +393,7 @@ dependencies = [
 [[package]]
 name = "rbake"
 version = "0.1.0"
+source = "git+https://github.com/R5Flowstate/r5ed?rev=99be814c21580778f82029d4211d94a5ed199275#99be814c21580778f82029d4211d94a5ed199275"
 dependencies = [
  "bytemuck",
  "glam",
@@ -406,6 +407,7 @@ dependencies = [
 [[package]]
 name = "rbsp"
 version = "0.1.0"
+source = "git+https://github.com/R5Flowstate/r5ed?rev=99be814c21580778f82029d4211d94a5ed199275#99be814c21580778f82029d4211d94a5ed199275"
 dependencies = [
  "bytemuck",
  "serde",
@@ -415,6 +417,7 @@ dependencies = [
 [[package]]
 name = "rcomp"
 version = "0.1.0"
+source = "git+https://github.com/R5Flowstate/r5ed?rev=99be814c21580778f82029d4211d94a5ed199275#99be814c21580778f82029d4211d94a5ed199275"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -435,6 +438,7 @@ dependencies = [
 [[package]]
 name = "rdoc"
 version = "0.1.0"
+source = "git+https://github.com/R5Flowstate/r5ed?rev=99be814c21580778f82029d4211d94a5ed199275#99be814c21580778f82029d4211d94a5ed199275"
 dependencies = [
  "glam",
  "indexmap",
@@ -449,6 +453,7 @@ dependencies = [
 [[package]]
 name = "rir"
 version = "0.1.0"
+source = "git+https://github.com/R5Flowstate/r5ed?rev=99be814c21580778f82029d4211d94a5ed199275#99be814c21580778f82029d4211d94a5ed199275"
 dependencies = [
  "glam",
  "serde",
@@ -464,6 +469,7 @@ checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
 [[package]]
 name = "rpak"
 version = "0.1.0"
+source = "git+https://github.com/R5Flowstate/r5ed?rev=99be814c21580778f82029d4211d94a5ed199275#99be814c21580778f82029d4211d94a5ed199275"
 dependencies = [
  "serde",
  "serde_json",
@@ -473,6 +479,7 @@ dependencies = [
 [[package]]
 name = "rterrain"
 version = "0.1.0"
+source = "git+https://github.com/R5Flowstate/r5ed?rev=99be814c21580778f82029d4211d94a5ed199275#99be814c21580778f82029d4211d94a5ed199275"
 dependencies = [
  "glam",
  "image",

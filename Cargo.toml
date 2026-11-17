@@ -9,9 +9,9 @@ publish = false
 
 [dependencies]
 # Kainz's own map editor crates, read-only by path. Never edit them from here.
-rbsp = { path = "../../../../apex/r5ed/crates/rbsp" }
-rcomp = { path = "../../../../apex/r5ed/crates/rcomp" }
-rpak = { path = "../../../../apex/r5ed/crates/rpak" }
+rbsp = { git = "https://github.com/R5Flowstate/r5ed", rev = "99be814c21580778f82029d4211d94a5ed199275" }
+rcomp = { git = "https://github.com/R5Flowstate/r5ed", rev = "99be814c21580778f82029d4211d94a5ed199275" }
+rpak = { git = "https://github.com/R5Flowstate/r5ed", rev = "99be814c21580778f82029d4211d94a5ed199275" }
 glam = "0.30"
 serde_json = "1"
 anyhow = "1"
