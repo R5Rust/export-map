@@ -612,8 +612,33 @@ fn move_tree(from: &Path, to: &Path) -> Result<()> {
 /// by `scale`, then `rot`, then `origin` (the rmdl vertex blocks are already on
 /// the axes a map places them on).
 fn add_model(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Vec3, rot: Quat, scale: f32, mats_out: &mut BTreeSet<u64>) {
-    add_model_flip(groups, model, origin, rot, scale, mats_out, model_needs_flip(model))
+    add_model_flip(groups, model, origin, rot, scale, mats_out, model_needs_flip(model), None, "")
 }
+
+/// The studiohdr skin table: `numskinref` (+148), `numskinfamilies` (+150) and `skinindex` (+152,
+/// a u16 header offset: the low bit means x16), then families x skinrefs i16 texture indices
+/// (studio_r5_v16.h `studiohdr_t`). Family 0 is the identity; a static prop picks one with its
+/// record's skin halfword.
+fn skin_remap(rmdl: &[u8], skin: u16) -> Option<Vec<u16>> {
+    if skin == 0 {
+        return None;
+    }
+    let u16_at = |at: usize| rmdl.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let (nref, nfam, off) = (u16_at(148)? as usize, u16_at(150)? as usize, u16_at(152)?);
+    let base = ((off & 0xFFFE) as usize) << (4 * (off & 1) as usize);
+    if skin as usize >= nfam || nref == 0 {
+        return None;
+    }
+    (0..nref).map(|i| u16_at(base + (skin as usize * nref + i) * 2)).collect()
+}
+
+/// Static prop record flag byte (`StaticProp::unknown_1`), Source's `STATIC_PROP_*` bits as Respawn
+/// uses them. 0x10 = no shadow: none of this map's 1308 such props is in its own CSM caster tree
+/// (lumps 0x63/0x64), against 61% of the rest. 0x40 = drawn only in the 3D skybox (the vista).
+const PROP_NO_SHADOW: u8 = 0x10;
+const PROP_SKYBOX: u8 = 0x40;
+/// World mesh flag bit set on decal-class meshes (0x00100210 decals, 0x00100a10 blend, 0x00103210 water).
+const MESH_NO_SHADOW: u32 = 0x10;
 
 /// True when most of a model's triangles wind clockwise against their normals
 /// (D3D front faces), which glTF draws as back faces.
@@ -628,14 +653,18 @@ fn model_needs_flip(model: &rpak::rmdl::RmdlModel) -> bool {
     a * 2 < t
 }
 
-fn add_model_flip(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Vec3, rot: Quat, scale: f32, mats_out: &mut BTreeSet<u64>, flip: bool) {
+/// `skin`: a material-slot remap from `skin_remap`. `suffix` is appended to the group key
+/// ("|ns" no shadow, "|sky" 3D skybox) so such geometry keeps its own primitives and material.
+#[allow(clippy::too_many_arguments)]
+fn add_model_flip(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Vec3, rot: Quat, scale: f32, mats_out: &mut BTreeSet<u64>, flip: bool, skin: Option<&[u16]>, suffix: &str) {
     for m in &model.meshes {
-        let guid = model.textures.get(m.material as usize).copied().unwrap_or(0);
+        let slot = skin.and_then(|s| s.get(m.material as usize)).map_or(m.material as usize, |t| *t as usize);
+        let guid = model.textures.get(slot).or_else(|| model.textures.get(m.material as usize)).copied().unwrap_or(0);
         if m.indices.is_empty() {
             continue;
         }
         mats_out.insert(guid);
-        let key = format!("m:{guid:016x}");
+        let key = format!("m:{guid:016x}{suffix}");
         let p = groups.get(&key);
         let base = p.positions.len() as u32;
         for (i, v) in m.positions.iter().enumerate() {
@@ -657,7 +686,9 @@ fn add_model_flip(groups: &mut Groups, model: &rpak::rmdl::RmdlModel, origin: Ve
 fn model_plans(groups: &Groups, infos: &BTreeMap<u64, mats::MatInfo>, paks: &Paks, cap: u32) -> BTreeMap<String, MatPlan> {
     let mut plans = BTreeMap::new();
     for key in &groups.keys {
-        let Some(g) = key.strip_prefix("m:").and_then(|h| u64::from_str_radix(h, 16).ok()) else { continue };
+        let Some(rest) = key.strip_prefix("m:") else { continue };
+        let (rest, flags) = split_key_flags(rest);
+        let Ok(g) = u64::from_str_radix(rest, 16) else { continue };
         let info = infos.get(&g).cloned();
         if info.as_ref().is_some_and(|i| i.nodraw) {
             continue;
@@ -669,10 +700,55 @@ fn model_plans(groups: &Groups, infos: &BTreeMap<u64, mats::MatInfo>, paks: &Pak
         if mats::is_sky_material(&name) {
             eprintln!("  sky material kept: {name}");
         }
-        let extras = json!({"material": name, "shader": info.as_ref().map(|i| i.shader.clone()), "translucent": info.as_ref().map(|i| i.translucent), "sky": mats::is_sky_material(&name)});
+        let mut extras = json!({"material": name, "shader": info.as_ref().map(|i| i.shader.clone()), "translucent": info.as_ref().map(|i| i.translucent), "sky": mats::is_sky_material(&name)});
+        flags.apply(&mut extras);
         plans.insert(key.clone(), MatPlan { name, info, cap, extras });
     }
     plans
+}
+
+/// Placement flags a group key carries after the material ("|ns", "|sky").
+#[derive(Clone, Copy, Default)]
+struct KeyFlags {
+    no_shadow: bool,
+    skybox: bool,
+}
+
+impl KeyFlags {
+    fn suffix(self) -> &'static str {
+        match (self.no_shadow, self.skybox) {
+            (_, true) => "|sky",
+            (true, false) => "|ns",
+            _ => "",
+        }
+    }
+    /// glb material extras: `noShadow` (never casts sun shadows), `skybox` (3D skybox only:
+    /// drawn from the sky camera, never in the world pass, no shadows, no collision).
+    fn apply(self, extras: &mut Value) {
+        if self.no_shadow || self.skybox {
+            extras["noShadow"] = json!(true);
+        }
+        if self.skybox {
+            extras["skybox"] = json!(true);
+        }
+    }
+}
+
+/// Strips the placement suffixes off a group key.
+fn split_key_flags(key: &str) -> (&str, KeyFlags) {
+    let mut f = KeyFlags::default();
+    let mut k = key;
+    loop {
+        if let Some(r) = k.strip_suffix("|ns") {
+            f.no_shadow = true;
+            k = r;
+        } else if let Some(r) = k.strip_suffix("|sky") {
+            f.skybox = true;
+            k = r;
+        } else {
+            return (k, f);
+        }
+    }
 }
 
 // ------------------------------------------------------------- the map ----
@@ -974,6 +1050,15 @@ fn source_rot(angles: Vec3) -> Quat {
     Quat::from_euler(EulerRot::ZYX, angles.y.to_radians(), angles.x.to_radians(), angles.z.to_radians())
 }
 
+/// What a map's level script does to `skybox_cam_level` once entities load: (origin offset, new angles).
+/// mp_rr_canyonlands_staging_mu1.nut: `SKYBOX_Z_OFFSET_STAGING_AREA = 32.0`, `SKYBOX_ANGLES_STAGING_AREA = <0, 60, 0>`.
+fn sky_script_override(map: &str) -> Option<(Vec3, Vec3)> {
+    match map {
+        "mp_rr_canyonlands_staging_mu1" => Some((Vec3::new(0.0, 0.0, 32.0), Vec3::new(0.0, 60.0, 0.0))),
+        _ => None,
+    }
+}
+
 fn r1(v: f32) -> f64 {
     (v as f64 * 10.0).round() / 10.0
 }
@@ -1004,7 +1089,19 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
         }
     }
     let class = |e: &rbsp::lumps::entities::Entity| e.classname().unwrap_or("").to_string();
-    let sky_camera = ents.iter().find(|e| class(e) == "sky_camera").and_then(|e| kv_vec3(e, "origin"));
+    let sky_ent = ents.iter().find(|e| class(e) == "sky_camera");
+    let sky_camera = sky_ent.and_then(|e| kv_vec3(e, "origin"));
+    // The 3D skybox (docs/skybox.md): the client draws it from sky_camera + R^T * eye / skyscale.
+    // "skyscale" is m_skybox3d.scale (the S21 client divides by it, FUN_14099df90); "scale" is unused.
+    let sky_scale = sky_ent.and_then(|e| e.get("skyscale")).and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(16.0);
+    let mut sky_angles = sky_ent.and_then(|e| kv_vec3(e, "angles")).unwrap_or(Vec3::ZERO);
+    let mut sky_camera = sky_camera;
+    if let (Some(over), Some(c)) = (sky_script_override(&stem), sky_camera.as_mut()) {
+        // Level scripts move the camera at EntitiesDidLoad; the BSP can't know.
+        *c += over.0;
+        sky_angles = over.1;
+        eprintln!("  sky camera moved by the level script: {c:?} angles {sky_angles:?}");
+    }
     // Where players actually go: spawns, range targets and the props scripts
     // use, plus a margin. Static props inside keep LOD0.
     let play_area: Option<(Vec3, Vec3)> = {
@@ -1084,9 +1181,12 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
         let name = r.material.replace('\\', "/").to_ascii_lowercase();
         world_names.insert(name.clone());
         let page = page_of(mi).filter(|_| lightmaps.is_some());
+        // Mesh flag 0x10 marks decal-class meshes (decals, blended overlays, water): the map's own
+        // CSM shadow meshes (lumps 0x7C-0x7F) leave them out, so they never cast sun shadows.
+        let flags = KeyFlags { no_shadow: r.flags & MESH_NO_SHADOW != 0, skybox: false };
         let key = match page {
-            Some(_) => format!("w:{name}"),
-            None => format!("w:{name}|nolm"),
+            Some(_) => format!("w:{name}{}", flags.suffix()),
+            None => format!("w:{name}|nolm{}", flags.suffix()),
         };
         let p = groups.get(&key);
         let base = p.positions.len() as u32;
@@ -1124,6 +1224,20 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
     let mut prop_count = 0usize;
     let mut prop_skipped: BTreeMap<String, usize> = BTreeMap::new();
     let mut prop_mat_guids = BTreeSet::new();
+    // The skybox vistas: props drawn only from the sky camera. The client lights them with their own
+    // light probe (LUMP_STATIC_PROP_LIGHTPROBE_INDEX 0x66, one u32 per prop) and env cubemap (record
+    // halfword unknown_3), since a nearest-probe lookup out there finds nothing meaningful.
+    let skybox_props: Vec<Value> = sprp.as_ref().map_or_else(Vec::new, |sp| {
+        let probes = bsp.lump(0x66);
+        (0..sp.prop_count().min(sp.props.len()))
+            .filter(|&i| sp.props[i].unknown_1 & PROP_SKYBOX != 0)
+            .map(|i| {
+                let p = sp.props[i];
+                let probe = probes.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                json!({"index": i, "model": sp.model_of(i), "origin": p.origin, "angles": p.angles, "probe": probe, "cubemap": p.unknown_3})
+            })
+            .collect()
+    });
     if let Some(sp) = &sprp {
         let n = sp.prop_count().min(sp.props.len());
         let wanted: BTreeSet<String> = (0..n)
@@ -1197,6 +1311,8 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
         );
         let mut parsed: HashMap<(String, usize), Option<(rpak::rmdl::RmdlModel, bool)>> = HashMap::new();
         let mut lod_tris = [0usize; 8];
+        let mut skinned = 0usize;
+        let mut flag_hist: BTreeMap<&str, usize> = BTreeMap::new();
         for i in 0..n {
             let rec = sp.props[i];
             let Some(name) = sp.model_of(i).map(|m| m.replace('\\', "/").to_ascii_lowercase()) else { continue };
@@ -1204,8 +1320,10 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
                 *prop_skipped.entry(name).or_default() += 1;
                 continue;
             };
-            let ring = lod_for(Vec3::from(rec.origin));
-            let lod = (ring + base_lod.get(&name).copied().unwrap_or(0)).min(lod_count(rmdl) - 1);
+            let pflags = KeyFlags { no_shadow: rec.unknown_1 & PROP_NO_SHADOW != 0, skybox: rec.unknown_1 & PROP_SKYBOX != 0 };
+            // A skybox vista is seen from the sky camera a few units away: always full detail.
+            let ring = if pflags.skybox { 0 } else { lod_for(Vec3::from(rec.origin)) };
+            let lod = if pflags.skybox { 0 } else { (ring + base_lod.get(&name).copied().unwrap_or(0)).min(lod_count(rmdl) - 1) };
             let entry = parsed.entry((name.clone(), lod)).or_insert_with(|| match parse_lod(rmdl, vg, lod) {
                 Ok(m) => {
                     let f = model_needs_flip(&m);
@@ -1222,10 +1340,16 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
             };
             let scale = if rec.scale > 0.0 { rec.scale } else { 1.0 };
             lod_tris[lod.min(7)] += model.meshes.iter().map(|m| m.indices.len() / 3).sum::<usize>();
-            add_model_flip(&mut groups, model, Vec3::from(rec.origin), source_rot(Vec3::from(rec.angles)), scale, &mut prop_mat_guids, *flip);
+            let skin = skin_remap(rmdl, rec.unknown_2);
+            if skin.is_some() {
+                skinned += 1;
+            }
+            *flag_hist.entry(pflags.suffix()).or_default() += 1;
+            add_model_flip(&mut groups, model, Vec3::from(rec.origin), source_rot(Vec3::from(rec.angles)), scale, &mut prop_mat_guids, *flip, skin.as_deref(), pflags.suffix());
             prop_count += 1;
         }
         eprintln!("  prop triangles by LOD: {:?}", &lod_tris[..4]);
+        eprintln!("  props by placement (''=normal, |ns=no shadow, |sky=3D skybox): {flag_hist:?}; {skinned} drawn with a non-default skin");
         let fixed: BTreeSet<&str> =
             parsed.iter().filter(|(_, v)| v.as_ref().is_some_and(|(m, _)| m.surface_prop.ends_with("|axes-fixed"))).map(|(k, _)| k.0.as_str()).collect();
         eprintln!("  {} static models stored on turned axes (rotated back): {:?}", fixed.len(), fixed.iter().take(12).collect::<Vec<_>>());
@@ -1254,6 +1378,7 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
     let lm_index = lightmaps.as_ref().map(|_| ());
     for key in &groups.keys {
         let Some(rest) = key.strip_prefix("w:") else { continue };
+        let (rest, kflags) = split_key_flags(rest);
         let (name, lit) = match rest.strip_suffix("|nolm") {
             Some(n) => (n, false),
             None => (rest, true),
@@ -1265,8 +1390,9 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
         if mats::is_sky_material(name) {
             eprintln!("  sky material kept (world): {name}");
         }
-        let extras = json!({"material": name, "world": true, "lightmapped": lit && lm_index.is_some(),
+        let mut extras = json!({"material": name, "world": true, "lightmapped": lit && lm_index.is_some(),
             "shader": info.as_ref().map(|i| i.shader.clone()), "translucent": info.as_ref().map(|i| i.translucent), "sky": mats::is_sky_material(name)});
+        kflags.apply(&mut extras);
         plans.insert(key.clone(), MatPlan { name: name.to_string(), info, cap: args.world_cap, extras });
     }
 
@@ -1415,6 +1541,9 @@ fn export_map(args: &Args, cfg: Config) -> Result<()> {
         "combatTargets": targets,
         "sun": sun,
         "skyCamera": sky_camera.map(|v| [v.x, v.y, v.z]),
+        "skyCameraAngles": [sky_angles.x, sky_angles.y, sky_angles.z],
+        "skyScale": sky_scale,
+        "skyboxProps": skybox_props,
         "materials": materials.len(),
         "drawCalls": draw_calls,
         "triangles": tris,
