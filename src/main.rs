@@ -986,6 +986,12 @@ fn write_collision(bsp: &rbsp::Bsp, paks: &Paks, prefer: &[&str], out_dir: &Path
                 }
             };
             let main_tree = main_tree.unwrap_or_else(|| coll::Decoded { tris: Vec::new(), props: Vec::new(), stats: Default::default() });
+            // R5_PROPCOLL=physics: collide players against the prop's physics tree where it has one (the coarse shell
+            // the model header points at) instead of the detailed tree 0. Probe data suggests the game does this.
+            let (main_tree, physics) = match (std::env::var("R5_PROPCOLL").as_deref(), physics) {
+                (Ok("physics"), Some(p)) if !p.tris.is_empty() => (p, None),
+                (_, p) => (main_tree, p),
+            };
             let phys_n = physics.as_ref().map_or(0, |d| d.tris.len());
             if verbose && space_checks < 6 {
                 // The trees should sit inside the studiohdr hull (the axes a map places it on).
