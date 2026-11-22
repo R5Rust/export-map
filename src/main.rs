@@ -28,10 +28,15 @@ use assets::{Config, Paks};
 use tex::Role;
 
 const DEFAULT_MAP: &str = "mp_rr_canyonlands_staging_mu1";
-const DEFAULT_RSX: &str = r"%USERPROFILE%\Downloads\r5ed-5ebc9ec-win64\r5ed\rsx.exe";
+// Under %USERPROFILE% (dev-machine defaults; the installer always passes R5_RSX / R5_GAME_ROOT).
+const DEFAULT_RSX: &str = r"Downloads\r5ed-5ebc9ec-win64\r5ed\rsx.exe";
 // S21 game root, only for S21 exports (retail exports set R5_GAME_ROOT). The main S21 install was removed
 // 2026-11-20; r5-modkit's test copy has the same stock paks and maps (hardlinks) with its own dlls.
-const DEFAULT_GAME: &str = r"%USERPROFILE%\Games\R5Flowstate-modkit-test";
+const DEFAULT_GAME: &str = r"Games\R5Flowstate-modkit-test";
+
+fn in_profile(rel: &str) -> PathBuf {
+    std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default().join(rel)
+}
 
 struct Args {
     map: String,
@@ -63,7 +68,7 @@ fn usage() -> ! {
          options above only apply then)
          --collision: only (re)write collision.bin, reusing the BSP the last export extracted\n\
          --prop-physics: also write static props' physics trees into collision.bin (source 3)\n\
-         env: R5_GAME_ROOT (default {DEFAULT_GAME}), R5_RSX (default the r5ed bundle's rsx.exe), R5_EXPORT_WORK (default %TEMP%\\r5-export-map)"
+         env: R5_GAME_ROOT (default %USERPROFILE%\\{DEFAULT_GAME}), R5_RSX (default the r5ed bundle's rsx.exe), R5_EXPORT_WORK (default %TEMP%\\r5-export-map)"
     );
     std::process::exit(2)
 }
@@ -106,8 +111,8 @@ fn model_out(models_root: &Path, model: &str) -> PathBuf {
 
 fn config() -> Config {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
-    let rsx = env("R5_RSX").or_else(|| env("R5ED_RSX")).unwrap_or_else(|| PathBuf::from(DEFAULT_RSX));
-    let game_root = env("R5_GAME_ROOT").unwrap_or_else(|| PathBuf::from(DEFAULT_GAME));
+    let rsx = env("R5_RSX").or_else(|| env("R5ED_RSX")).unwrap_or_else(|| in_profile(DEFAULT_RSX));
+    let game_root = env("R5_GAME_ROOT").unwrap_or_else(|| in_profile(DEFAULT_GAME));
     let work = env("R5_EXPORT_WORK").unwrap_or_else(|| std::env::temp_dir().join("r5-export-map"));
     Config { game_root, rsx, work }
 }
