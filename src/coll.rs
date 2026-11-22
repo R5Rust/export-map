@@ -17,6 +17,8 @@
 //!   V x [f32; 3] positions, T x [u32; 3] indices, T x u32 contents mask,
 //!   T x u8 source (0 world poly, 1 world hull, 2 static prop collision tree, 3 static prop
 //!   physics tree, only written with `--prop-physics`). Player movement uses 0, 1 and 2.
+//!   Version 2 adds T x u8 surface type: the surfaceproperties id (`surfacePropId` of the leaf's
+//!   dsurfaceproperty_t, which `gamematerial` and the impact tables key on), 255 = unknown.
 //! Prop triangles carry [`prop_contents`] (leaf mask combined with the model's mask).
 
 use std::collections::{BTreeMap, HashMap};
@@ -65,6 +67,9 @@ pub struct Tree<'a> {
     pub origin: Vec3,
     pub scale: f32,
     pub masks: &'a [u32],
+    /// The tree's surface property records (dsurfaceproperty_t, 8 bytes: u16, u8 surfacePropId, u8 contents,
+    /// i32 name); a poly leaf header's low 12 bits index them.
+    pub surf: &'a [u8],
 }
 
 #[derive(Default, Debug)]
@@ -83,7 +88,8 @@ pub struct PropRef {
 }
 
 pub struct Decoded {
-    pub tris: Vec<([Vec3; 3], u32, u8)>,
+    /// (corners, contents mask, source, surface type)
+    pub tris: Vec<([Vec3; 3], u32, u8, u8)>,
     pub props: Vec<PropRef>,
     pub stats: Stats,
 }
@@ -96,6 +102,9 @@ impl Tree<'_> {
     fn word(&self, i: usize) -> Option<u32> {
         let at = i.checked_mul(4)?;
         self.leaf.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn surf_type(&self, idx: u32) -> u8 {
+        self.surf.get(idx as usize * 8 + 2).copied().unwrap_or(255)
     }
     fn byte(&self, at: usize) -> Option<u8> {
         self.leaf.get(at).copied()
@@ -194,6 +203,7 @@ impl Tree<'_> {
     /// Returns the leaf's size in dwords.
     fn poly(&self, kind: u32, at: usize, mask: u32, src: u8, local: Option<&[Vec3]>, out: &mut Decoded) -> Option<usize> {
         let h = self.word(at)?;
+        let st = self.surf_type(h & 0xFFF);
         let count = ((h >> 12) & 0xF) as usize + 1;
         let quad = kind & 2 != 0;
         let packed = kind & 1 != 0;
@@ -214,10 +224,10 @@ impl Tree<'_> {
                 out.stats.bad_refs += 1;
                 continue;
             };
-            out.tris.push(([a, b, c], mask, src));
+            out.tris.push(([a, b, c], mask, src, st));
             if quad {
                 // The fourth corner is implied: b + c - a (single precision, like the engine).
-                out.tris.push(([c, b, b + c - a], mask, src));
+                out.tris.push(([c, b, b + c - a], mask, src, st));
             }
         }
         Some(1 + count)
@@ -250,9 +260,10 @@ impl Tree<'_> {
 
 /// A model's embedded collision (studiohdr v16/v17 `bvhOffset`), in model space, one entry per
 /// tree the model carries.
-pub fn rmdl_collision(rmdl: &[u8]) -> Result<Option<Vec<Decoded>>> {
-    const BVH_OFFSET_FIELD: usize = 0xD6;
-    let raw = rmdl.get(BVH_OFFSET_FIELD..BVH_OFFSET_FIELD + 2).map(|b| u16::from_le_bytes([b[0], b[1]])).ok_or_else(|| anyhow!("short studiohdr"))?;
+/// `v19`: the retail header (studiohdr_v19_2_t, mdl v20/v21) keeps `bvhOffset` at 0xE6, ten fields later.
+pub fn rmdl_collision(rmdl: &[u8], v19: bool) -> Result<Option<Vec<Decoded>>> {
+    let bvh_field: usize = if v19 { 0xE6 } else { 0xD6 };
+    let raw = rmdl.get(bvh_field..bvh_field + 2).map(|b| u16::from_le_bytes([b[0], b[1]])).ok_or_else(|| anyhow!("short studiohdr"))?;
     if raw == 0 {
         return Ok(None);
     }
@@ -263,7 +274,7 @@ pub fn rmdl_collision(rmdl: &[u8]) -> Result<Option<Vec<Decoded>>> {
     // RSX reads it from the header's base; accept the field-relative reading too if that is the
     // only one that parses.
     let mut found = None;
-    for base in [fixed, BVH_OFFSET_FIELD + fixed] {
+    for base in [fixed, bvh_field + fixed] {
         let (Some(cm), Some(sp), Some(sn), Some(hc)) = (i32_at(base), i32_at(base + 4), i32_at(base + 8), i32_at(base + 12)) else { continue };
         let ok = (1..=64).contains(&hc) && sp >= 16 && cm >= sp && sn >= cm && base + (sn as usize) <= rmdl.len();
         if ok {
@@ -272,6 +283,9 @@ pub fn rmdl_collision(rmdl: &[u8]) -> Result<Option<Vec<Decoded>>> {
         }
     }
     let Some((base, cm, sn, hc)) = found else { return Err(anyhow!("bvh header does not parse (offset {raw:#x})")) };
+    // surface property records sit between surfacePropsIndex and contentMasksIndex
+    let sp_at = i32_at(base + 4).unwrap_or(0).max(0) as usize;
+    let surf: &[u8] = rmdl.get(base + sp_at..base + cm).unwrap_or(&[]);
     let masks: Vec<u32> = (0..(sn - cm) / 4).filter_map(|i| i32_at(base + cm + i * 4).map(|v| v as u32)).collect();
     let blob = &rmdl[base..];
     let mut all = Vec::new();
@@ -293,6 +307,7 @@ pub fn rmdl_collision(rmdl: &[u8]) -> Result<Option<Vec<Decoded>>> {
             origin,
             scale,
             masks: &masks,
+            surf,
         };
         all.push(tree.decode());
     }
@@ -303,8 +318,8 @@ pub fn rmdl_collision(rmdl: &[u8]) -> Result<Option<Vec<Decoded>>> {
 /// every model with a single tree and 1 on every model with two, and exactly the models with a
 /// vphysics `.phy` have two, so it names the physics replica (RSX's note in
 /// `ExportPhysicsModelBVH`: a coarse shell "more or less identical to the vphysics one").
-pub fn physics_tree_index(rmdl: &[u8]) -> Option<usize> {
-    rmdl.get(0xD8).copied().filter(|&b| b != 0xFF).map(usize::from)
+pub fn physics_tree_index(rmdl: &[u8], v19: bool) -> Option<usize> {
+    rmdl.get(if v19 { 0xE8 } else { 0xD8 }).copied().filter(|&b| b != 0xFF).map(usize::from)
 }
 
 /// Splits a model's trees into (collision, physics). Tree 0 is the default the engine traces
@@ -329,6 +344,7 @@ pub struct Soup {
     pub idx: Vec<[u32; 3]>,
     pub mask: Vec<u32>,
     pub src: Vec<u8>,
+    pub surf: Vec<u8>,
     lookup: HashMap<[u32; 3], u32>,
     pub degenerate: usize,
 }
@@ -345,7 +361,7 @@ impl Soup {
         i
     }
 
-    pub fn push(&mut self, t: [Vec3; 3], mask: u32, src: u8) {
+    pub fn push(&mut self, t: [Vec3; 3], mask: u32, src: u8, surf: u8) {
         if (t[1] - t[0]).cross(t[2] - t[0]).length_squared() < 1e-8 {
             self.degenerate += 1;
             return;
@@ -358,6 +374,7 @@ impl Soup {
         self.idx.push(i);
         self.mask.push(mask);
         self.src.push(src);
+        self.surf.push(surf);
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -367,7 +384,7 @@ impl Soup {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(24 + self.pos.len() * 12 + self.idx.len() * 17);
         b.extend_from_slice(b"R5COLL\0\0");
-        for v in [1u32, self.pos.len() as u32, self.idx.len() as u32, 0] {
+        for v in [2u32, self.pos.len() as u32, self.idx.len() as u32, 0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
         for p in &self.pos {
@@ -384,6 +401,7 @@ impl Soup {
             b.extend_from_slice(&m.to_le_bytes());
         }
         b.extend_from_slice(&self.src);
+        b.extend_from_slice(&self.surf);
         b
     }
 }

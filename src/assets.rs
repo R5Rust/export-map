@@ -39,6 +39,56 @@ pub struct Paks {
     pub by_guid: BTreeMap<u64, Vec<(String, String)>>,
 }
 
+/// Respawn's rpak StringToGuid: an asset's guid is this hash of its path (`mdl/props/x.rmdl`). Port of r5ed-compile's
+/// `string_to_guid`; checked against the asset catalog (material/world/concrete/dam_concrete_02_stained_bm_wldc.rpak
+/// -> 0xE779D0F273761152).
+pub fn string_to_guid(name: &str) -> u64 {
+    let mut b: Vec<u8> = name.bytes().collect();
+    b.extend_from_slice(&[0u8; 8]);
+    let word = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let mut acc: u64 = 0;
+    let mut at = 0usize;
+    let (v5, v12, v11) = loop {
+        let w = word(at);
+        let v4 = !w & w.wrapping_sub(0x0101_0101) & 0x8080_8080;
+        let v5 = v4 ^ v4.wrapping_sub(1);
+        let v6 = (v5 & w) ^ 0x5C5C_5C5C;
+        let v7 = !v6 & v6.wrapping_sub(0x0101_0101) & 0x8080_8080;
+        let mut v8 = v7 & v7.wrapping_neg();
+        if v7 != v8 {
+            let mut v9: u32 = 0xFF00_0000;
+            loop {
+                let prev = v9;
+                if v9 & v6 == 0 {
+                    v8 |= v9 & 0x8080_8080;
+                }
+                v9 >>= 8;
+                if prev < 0x100 {
+                    break;
+                }
+            }
+        }
+        let v11 = 0x633D_5F1u64.wrapping_mul(acc);
+        let inner = (v5 & w).wrapping_sub(45u32.wrapping_mul(v8 >> 7)) & 0xDFDF_DFDF;
+        let v12 = 0xFB8C_4D96_501u64.wrapping_mul(u64::from(inner)) >> 24;
+        if v4 != 0 {
+            break (v5, v12, v11);
+        }
+        at += 4;
+        let sum = v11.wrapping_add(v12);
+        acc = (sum >> 61) ^ sum;
+    };
+    let high = if v5 == 0 { 0i64 } else { i64::from(31 - v5.leading_zeros()) };
+    let index = (at as u32).wrapping_add((high / 8) as u32);
+    v12.wrapping_add(v11).wrapping_sub(0xAE50_2812_AA73_33u64.wrapping_mul(u64::from(index)))
+}
+
+/// The by_path key RSX gives an unnamed asset whose name is `path`: `<first folder>/0x<guid>` (no zero padding).
+pub fn unnamed_key(path: &str) -> String {
+    let folder = path.split('/').next().unwrap_or("");
+    format!("{folder}/0x{:x}", string_to_guid(path))
+}
+
 pub fn mirror_dir(cfg: &Config) -> PathBuf {
     cfg.work.join("mirror").join("paks").join("Win64")
 }
@@ -170,7 +220,25 @@ pub fn run_rsx(cfg: &Config, args: &[std::ffi::OsString], cwd: &Path) -> Result<
 fn run_rsx_once(cfg: &Config, args: &[std::ffi::OsString], cwd: &Path) -> Result<String> {
     std::fs::create_dir_all(cwd)?;
     let t = Instant::now();
-    let out = Command::new(&cfg.rsx)
+    // Model exports can go through a second RSX (R5_RSX_MODELS): retail Apex models are mdl v21, which the r5ed
+    // bundle's RSX 1.2.1 can't read. D:\R5Rust\tools\rsx-src (2.4 + upstream's v21 cases) can, and writes the same raw
+    // .rmdl/.vg pair when asked for format 3 (it defaults to Cast).
+    // "--cast" (ours, not RSX's): keep RSX 2.4's default model format, Cast.
+    let cast = args.iter().any(|a| a == "--cast");
+    let args: Vec<&std::ffi::OsString> = args.iter().filter(|a| *a != "--cast").collect();
+    let models = args.windows(2).any(|w| *w[0] == "--exporttypes" && *w[1] == "mdl_");
+    let modern = models.then(|| std::env::var_os("R5_RSX_MODELS").map(PathBuf::from)).flatten();
+    let mut cmd = Command::new(modern.as_ref().unwrap_or(&cfg.rsx));
+    if let Some(rsx) = &modern {
+        // R5Flowstate's RSX fork (github.com/R5Flowstate/rsx, what tools/install.ps1 uses) picks formats with
+        // `--exportsetting mdl_=N` (0 Cast, 2 raw RMDL, its default); our old patched 2.4 build took `--exportformat`.
+        if is_rsx_fork(rsx) {
+            cmd.args(["--exportsetting", if cast { "mdl_=0" } else { "mdl_=2" }]);
+        } else if !cast {
+            cmd.args(["--exportformat", "mdl_=3"]);
+        }
+    }
+    let out = cmd
         .arg("-nogui")
         .arg("-nocachedb")
         .args(args)
@@ -193,6 +261,20 @@ fn run_rsx_once(cfg: &Config, args: &[std::ffi::OsString], cwd: &Path) -> Result
         bail!("rsx crashed (see its output): {}", text.lines().rev().take(5).collect::<Vec<_>>().join(" | "));
     }
     Ok(text)
+}
+
+/// True for R5Flowstate's RSX fork (r5ed's bundled rsx.exe is an older build of it): the only builds that know
+/// `--exportpak` (upstream and our old patched 2.4 don't). Checked once per exe, by its bytes.
+fn is_rsx_fork(rsx: &Path) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(&v) = seen.lock().unwrap().get(rsx) {
+        return v;
+    }
+    let v = std::fs::read(rsx).map(|b| b.windows(11).any(|w| w == b"--exportpak")).unwrap_or(false);
+    seen.lock().unwrap().insert(rsx.to_path_buf(), v);
+    v
 }
 
 /// Starpak names RSX reported it could not open (the `.opt` ones are
@@ -255,7 +337,20 @@ impl Paks {
                 }
                 std::fs::rename(&tmp, &csv).with_context(|| format!("RSX wrote no listing for {base}"))?;
             }
+            // Retail lists newer formats with a minor version in rsxver ("v23.2" for v23 materials); r5ed's parser
+            // takes a whole number, so keep the major part. S21 listings never have one.
             let text = std::fs::read_to_string(&csv)?;
+            let text = text
+                .lines()
+                .map(|l| {
+                    let mut f: Vec<&str> = l.splitn(4, ',').collect();
+                    if f.len() == 4 && f[2].starts_with('v') {
+                        f[2] = f[2].split('.').next().unwrap_or(f[2]);
+                    }
+                    f.join(",")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             let rows = rpak::parse_asset_list(&text).map_err(|e| anyhow!("{}: {e}", csv.display()))?;
             for r in rows {
                 let path = r.path.replace('\\', "/").to_ascii_lowercase();
@@ -313,7 +408,10 @@ impl Paks {
     /// The first row of `kind` at `path` (lower-case, `/`), preferring the
     /// order of `prefer` when several paks carry it.
     pub fn find(&self, path: &str, kind: &str, prefer: &[&str]) -> Option<&Row> {
-        let rows = self.by_path.get(&path.replace('\\', "/").to_ascii_lowercase())?;
+        let key = path.replace('\\', "/").to_ascii_lowercase();
+        // Retail paks carry no asset names (`mdl\0x4D874CEE9B0508A7`): the guid is the hash of the name, so look the
+        // name up by its hash under the same folder.
+        let rows = self.by_path.get(&key).or_else(|| self.by_path.get(&unnamed_key(&key)))?;
         let mut best: Option<&Row> = None;
         let rank = |p: &str| prefer.iter().position(|q| *q == p).unwrap_or(usize::MAX);
         for r in rows.iter().filter(|r| r.kind == kind) {
@@ -376,5 +474,15 @@ impl Paks {
             eprintln!("  {kind}: {} from {pak} in {:.1}s", list.len(), t.elapsed().as_secs_f32());
         }
         Ok(missing)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn guid_matches_the_catalog() {
+        assert_eq!(super::string_to_guid("material/world/concrete/dam_concrete_02_stained_bm_wldc.rpak"), 0xE779_D0F2_7376_1152);
+        assert_eq!(super::string_to_guid("mdl/props/charge_pylon/charge_pylon_01_cells.rmdl"), 0xB269_9222_3525_B5FD);
+        assert_eq!(super::unnamed_key("mdl/props/charge_pylon/charge_pylon_01_cells.rmdl"), "mdl/0xb26992223525b5fd");
     }
 }
