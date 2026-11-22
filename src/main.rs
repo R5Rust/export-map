@@ -98,10 +98,18 @@ fn parse_args() -> Args {
     a
 }
 
-/// `mapcache/` at the project root, two levels above this crate.
+/// Where `--model` exports and the dynamic-prop model cache go: R5_MAPCACHE, else `mapcache/` at the project root (two
+/// levels above this crate) while that source tree exists, else `<R5_EXPORT_WORK>/mapcache` (a prebuilt exe on a
+/// player's PC: the build machine's path means nothing there).
 fn mapcache_root() -> PathBuf {
+    if let Some(p) = std::env::var_os("R5_MAPCACHE") {
+        return PathBuf::from(p);
+    }
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    crate_dir.parent().and_then(Path::parent).map_or_else(|| crate_dir.join("mapcache"), |root| root.join("mapcache"))
+    if crate_dir.join("Cargo.toml").is_file() {
+        return crate_dir.parent().and_then(Path::parent).map_or_else(|| crate_dir.join("mapcache"), |root| root.join("mapcache"));
+    }
+    config().work.join("mapcache")
 }
 
 /// `models_root` + a `/`-separated relative glb path, with native separators.

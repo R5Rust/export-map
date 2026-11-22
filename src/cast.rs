@@ -140,7 +140,19 @@ pub fn read_model(b: &[u8]) -> Result<RmdlModel> {
         // RSX names a mesh `<bodypart>_<model index>_LOD<n>_<material>`. The game spawns props and loot with body 0,
         // which draws model 0 of every bodypart; weapons keep each attachment (sights, suppressors, lasers) in its own
         // bodypart with an empty model 0, so drawing every mesh put all of them on the gun at once.
-        if let Some(stem) = m.string("n").split("_LOD").next() {
+        // R5Flowstate's fork leaves the LOD out: `<bodypart>_<model index>_<material>` (the material's file name, else
+        // its guid in decimal). Without "_LOD" the old split took the material's trailing number (quarryblock_01) for
+        // the model index and dropped 73 Firing Range models once the model cache was rebuilt with the fork.
+        let full = m.string("n");
+        let mat_hash = m.uints("m").first().copied().unwrap_or(0);
+        let mat_name = model.children.iter().find(|n| n.id == MATERIAL && n.hash == mat_hash).map(|n| n.string("n").to_string());
+        let stem = [mat_name.unwrap_or_default(), mat_hash.to_string()]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .find_map(|s| full.strip_suffix(s.as_str()).and_then(|r| r.strip_suffix('_')))
+            .map(|r| r.split("_LOD").next().unwrap_or(r))
+            .or_else(|| full.contains("_LOD").then(|| full.split("_LOD").next().unwrap_or(full)));
+        if let Some(stem) = stem {
             if let Some(idx) = stem.rsplit('_').next().and_then(|i| i.parse::<u32>().ok()) {
                 if idx != 0 {
                     SKIPPED_BODYGROUP_MESHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
